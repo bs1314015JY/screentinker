@@ -77,6 +77,9 @@ class GroupScheduleController(
         groupId = null
         playlist.setWallFollower(false)
         media.setVideoLooping(false)
+        // Close the play this member opened. Solo playback logs its own showings from here on;
+        // leaving the group row open would count the rest of the slot as a synced play.
+        playlist.endGroupSchedulePlay()
         report("group-sync exited")
         Log.i("GroupSchedule", "exit")
     }
@@ -88,7 +91,12 @@ class GroupScheduleController(
      * Hard teardown for Activity destruction — kills the tick so it can't outlive the Activity on the
      * main looper (the same leak the WallController.shutdown() fix addresses). Called from onDestroy.
      */
-    fun shutdown() { stopTimer(); groupId = null }
+    fun shutdown() {
+        stopTimer()
+        groupId = null
+        // stop() may already have closed the row. endGroupSchedulePlay is idempotent when it has not.
+        playlist.endGroupSchedulePlay()
+    }
 
     private fun stopTimer() {
         tick?.let { handler.removeCallbacks(it) }
@@ -98,7 +106,14 @@ class GroupScheduleController(
     private fun doTick() {
         if (groupId == null) return
         val sn = syncedNow()
-        val t = playlist.groupScheduleTarget(sn) ?: return
+        val t = playlist.groupScheduleTarget(sn)
+        if (t == null) {
+            // Every item is outside its daypart. The item already on screen is left where it is —
+            // this tick does not seek, swap, or advance. Close the open play so the gap is not
+            // reported as playback.
+            playlist.endGroupSchedulePlay()
+            return
+        }
         var action = "hold"
         // Double buffer: warm the next clip ~PRELOAD_LEAD_SEC before the boundary (once per boundary).
         if (t.nextIndex != t.index && t.secToBoundary in 0f..PRELOAD_LEAD_SEC && preloadedForIndex != t.nextIndex) {
@@ -139,6 +154,11 @@ class GroupScheduleController(
                 }
             }
         }
+        // Proof-of-play, after the correction so a reporting failure cannot skip this tick's seek.
+        // wallFollower (set in apply) is what stops the solo timer fighting the schedule, and it
+        // also suppresses playCurrentItem's log. A group has no leader to log in our place, so
+        // each member records its own slot here. Same slot on the next tick is a no-op.
+        playlist.noteGroupScheduleSlot(t.cycle, t.index)
         // Log discrete corrections (jump/align/seek) the instant they happen so the transition is
         // visible; only the routine steady-state line (hold/nudge) is throttled to ~1Hz. Otherwise the
         // one-tick "align" on load gets sampled over by a later "hold"/"nudge" and reads misleadingly.

@@ -103,8 +103,12 @@ class PlaylistController(
     private val items = mutableListOf<PlaylistItem>()
     private var currentIndex = -1
     // Proof-of-play: the item we last emitted a play_start for (so we can close it with play_end
-    // on the next show). Only set for loggable items (never wall followers).
+    // on the next show). Only set for loggable items. Video-wall followers never set it — the
+    // leader's row stands for the wall. Group-sync members do, via noteGroupScheduleSlot.
     private var loggedItem: PlaylistItem? = null
+    // The group-sync slot we have already opened a play for. Null until the first one this
+    // process logs, and the reason a 4Hz tick does not insert a row every quarter-second.
+    private var groupSlotKey: String? = null
     private val handler = Handler(Looper.getMainLooper())
     private var advanceRunnable: Runnable? = null
     private var isRunning = false
@@ -636,6 +640,7 @@ class PlaylistController(
         // Proof-of-play: close the open row so its duration is recorded on shutdown/screen-off.
         loggedItem?.let { onPlayLog?.invoke("play_end", it, true) }
         loggedItem = null
+        groupSlotKey = null
     }
 
     fun next() {
@@ -770,6 +775,9 @@ class PlaylistController(
 
         // Proof-of-play (parity with the web player): close the outgoing item and open this one.
         // Wall followers don't log — the leader's single row represents the whole wall.
+        // Group sync also sets wallFollower (so this timer does not fight the schedule) but a
+        // group has no leader. Its plays are recorded per slot in noteGroupScheduleSlot, not here,
+        // or every member would write a second row on the same showing.
         if (!wallFollower) {
             /*
              * ⚠️ NOT a hardcoded `true`. This passed the literal true, so `completed` could not be
@@ -850,7 +858,15 @@ class PlaylistController(
     // does NOT use this player's solo-playback duration clamp.
     // nextIndex + secToBoundary let the double buffer preload the upcoming clip a few seconds early.
     // For a single active slot, nextIndex == index (the caller skips preloading a self-loop).
-    data class GroupTarget(val index: Int, val posSec: Float, val nextIndex: Int, val secToBoundary: Float)
+    data class GroupTarget(
+        val index: Int,
+        val posSec: Float,
+        val nextIndex: Int,
+        val secToBoundary: Float,
+        // Which pass around the timeline this slot is. A one-item playlist never changes index,
+        // so the cycle is what distinguishes the next loop from the one already on screen.
+        val cycle: Long
+    )
     private fun slotMs(it: PlaylistItem): Long = (if (it.durationSec > 0) it.durationSec else 10).toLong() * 1000L
     fun groupScheduleTarget(syncedNowMs: Long): GroupTarget? {
         if (items.isEmpty()) return null
@@ -865,7 +881,58 @@ class PlaylistController(
             items.map { WallZones.SlotItem(it.durationSec, scheduleAllows(it), isLiveStream(it)) },
             syncedNowMs
         ) ?: return null
-        return GroupTarget(t.index, t.posSec, t.nextIndex, t.secToBoundary)
+        return GroupTarget(t.index, t.posSec, t.nextIndex, t.secToBoundary, t.cycle)
+    }
+
+    /**
+     * One occupancy of a group-sync slot. Playback is not touched: no seek, no swap, no advance.
+     * Called from the schedule tick after it has already applied the correction for this frame.
+     *
+     * The first call only opens a row. It does not close a play this method did not open, so a
+     * device that has been sitting in sync with an ancient open row does not get that row closed
+     * with "ended now".
+     */
+    fun noteGroupScheduleSlot(cycle: Long, index: Int) {
+        val item = itemAt(index) ?: return
+        val nextKey = GroupPlayLog.slotKey(cycle, index, item.itemKey)
+        val open = groupSlotKey
+        if (open == nextKey) return
+        val events = GroupPlayLog.events(
+            openSlot = open,
+            nextSlot = nextKey,
+            openLogs = open != null && loggedItem?.logPlay == true,
+            nextLogs = item.logPlay
+        )
+        groupSlotKey = nextKey
+        emitGroupPlay(events, item)
+        loggedItem = if (item.logPlay) item else null
+    }
+
+    /**
+     * The schedule has nothing to show (every item is outside its daypart), or group sync is
+     * being left. Closes the play this member opened, if any. Does not open a new one and does
+     * not move playback. Idempotent.
+     */
+    fun endGroupSchedulePlay() {
+        val open = groupSlotKey ?: return
+        val item = loggedItem
+        val events = GroupPlayLog.idle(open, item?.logPlay == true)
+        groupSlotKey = null
+        emitGroupPlay(events, null)
+        if (loggedItem === item) loggedItem = null
+    }
+
+    private fun emitGroupPlay(events: List<GroupPlayLog.Event>, next: PlaylistItem?) {
+        for (e in events) {
+            when (e) {
+                GroupPlayLog.Event.END -> loggedItem?.let { prev ->
+                    if (prev.logPlay) onPlayLog?.invoke("play_end", prev, PlayEnd.completed(false))
+                }
+                GroupPlayLog.Event.START -> if (next != null && next.logPlay) {
+                    onPlayLog?.invoke("play_start", next, false)
+                }
+            }
+        }
     }
 
     // Playable NOW = schedule-active AND its content is downloaded/available — and, offline, not an
